@@ -4,7 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 const supabaseUrl = 'https://qjimgaeizxbswxgldgcl.supabase.co/';
-const supabaseAnonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFqaW1nYWVpenhic3d4Z2xkZ2NsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk3MTA0NTcsImV4cCI6MjA5NTI4NjQ1N30.FWISDms_YBtRlfzYYHmsIov-7Gwpuv182BUmpeuxYMw';
+const supabaseAnonKey =
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFqaW1nYWVpenhic3d4Z2xkZ2NsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk3MTA0NTcsImV4cCI6MjA5NTI4NjQ1N30.FWISDms_YBtRlfzYYHmsIov-7Gwpuv182BUmpeuxYMw';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -31,6 +32,7 @@ class WordPracticeApp extends StatelessWidget {
         colorSchemeSeed: Colors.blue,
         useMaterial3: true,
         fontFamily: 'Arial',
+        visualDensity: VisualDensity.compact,
       ),
       home: const PracticePage(),
     );
@@ -126,9 +128,12 @@ class _PracticePageState extends State<PracticePage> {
         _words = words;
         _currentWord = words[_random.nextInt(words.length)];
         _loading = false;
+        _resultText = null;
+        _lastAnswerCorrect = null;
+        _hasCheckedCurrentQuestion = false;
       });
 
-      _focusAnswerInput();
+      _focusAnswerInputIfDesktop();
     } catch (e) {
       setState(() {
         _loading = false;
@@ -156,7 +161,7 @@ class _PracticePageState extends State<PracticePage> {
       _hasCheckedCurrentQuestion = false;
     });
 
-    _focusAnswerInput();
+    _focusAnswerInputIfDesktop();
   }
 
   void _checkAnswer() {
@@ -170,10 +175,13 @@ class _PracticePageState extends State<PracticePage> {
         _resultText = '請先輸入英文答案。';
         _lastAnswerCorrect = null;
       });
+
+      _focusAnswerInputIfDesktop();
       return;
     }
 
-    final isCorrect = _normalizeAnswer(userAnswer) == _normalizeAnswer(word.english);
+    final isCorrect =
+        _normalizeAnswer(userAnswer) == _normalizeAnswer(word.english);
 
     setState(() {
       _lastAnswerCorrect = isCorrect;
@@ -204,13 +212,17 @@ class _PracticePageState extends State<PracticePage> {
     if (shouldGoNext) {
       _pickRandomQuestion();
     } else {
-      _focusAnswerInput();
+      _focusAnswerInputIfDesktop();
     }
   }
 
-  void _focusAnswerInput() {
+  void _focusAnswerInputIfDesktop() {
     Future.delayed(const Duration(milliseconds: 80), () {
-      if (mounted) {
+      if (!mounted || _hasCheckedCurrentQuestion) return;
+
+      final width = MediaQuery.maybeOf(context)?.size.width ?? 999;
+
+      if (width >= 700) {
         _answerFocusNode.requestFocus();
       }
     });
@@ -230,20 +242,39 @@ class _PracticePageState extends State<PracticePage> {
     final accuracy = total == 0 ? 0 : ((_correctCount / total) * 100).round();
 
     return Scaffold(
+      resizeToAvoidBottomInset: true,
       backgroundColor: const Color(0xFFF4F7FB),
       appBar: AppBar(
-        title: const Text('中文題目 → 英文單字練習'),
+        title: const Text(
+          '英文單字練習',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
         centerTitle: true,
       ),
       body: SafeArea(
-        child: Center(
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 720),
-            child: Padding(
-              padding: const EdgeInsets.all(20),
-              child: _buildBody(total, accuracy),
-            ),
-          ),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final isMobile = constraints.maxWidth < 600;
+
+            return ListView(
+              keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+              padding: EdgeInsets.fromLTRB(
+                isMobile ? 12 : 20,
+                isMobile ? 12 : 20,
+                isMobile ? 12 : 20,
+                24,
+              ),
+              children: [
+                Center(
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 720),
+                    child: _buildBody(total, accuracy),
+                  ),
+                ),
+              ],
+            );
+          },
         ),
       ),
     );
@@ -251,8 +282,11 @@ class _PracticePageState extends State<PracticePage> {
 
   Widget _buildBody(int total, int accuracy) {
     if (_loading) {
-      return const Center(
-        child: CircularProgressIndicator(),
+      return const Padding(
+        padding: EdgeInsets.only(top: 120),
+        child: Center(
+          child: CircularProgressIndicator(),
+        ),
       );
     }
 
@@ -272,7 +306,12 @@ class _PracticePageState extends State<PracticePage> {
       );
     }
 
+    final screenWidth = MediaQuery.of(context).size.width;
+    final isMobile = screenWidth < 600;
+    final isVerySmall = screenWidth < 380;
+
     return Column(
+      mainAxisSize: MainAxisSize.min,
       children: [
         _ScoreCard(
           correctCount: _correctCount,
@@ -281,117 +320,126 @@ class _PracticePageState extends State<PracticePage> {
           accuracy: accuracy,
           onClear: _clearRecord,
         ),
-        const SizedBox(height: 24),
-        Expanded(
-          child: Center(
-            child: Card(
-              elevation: 2,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(24),
-              ),
-              child: Padding(
-                padding: const EdgeInsets.all(28),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      '題目',
-                      style: TextStyle(
-                        color: Colors.grey.shade600,
-                        fontSize: 16,
-                      ),
+        SizedBox(height: isMobile ? 12 : 24),
+        SizedBox(
+          width: double.infinity,
+          child: Card(
+            elevation: 2,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(isMobile ? 18 : 24),
+            ),
+            child: Padding(
+              padding: EdgeInsets.all(isMobile ? 16 : 28),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    '題目',
+                    style: TextStyle(
+                      color: Colors.grey.shade600,
+                      fontSize: isMobile ? 14 : 16,
                     ),
-                    const SizedBox(height: 10),
-                    Text(
-                      word.chinese,
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(
-                        fontSize: 40,
-                        fontWeight: FontWeight.bold,
-                      ),
+                  ),
+                  SizedBox(height: isMobile ? 6 : 10),
+                  Text(
+                    word.chinese,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: isVerySmall
+                          ? 28
+                          : isMobile
+                              ? 32
+                              : 40,
+                      fontWeight: FontWeight.bold,
+                      height: 1.15,
                     ),
-                    const SizedBox(height: 32),
-                    TextField(
-                      controller: _answerController,
-                      focusNode: _answerFocusNode,
-                      enabled: !_hasCheckedCurrentQuestion,
-                      textInputAction: TextInputAction.done,
-                      onSubmitted: (_) {
-                        if (!_hasCheckedCurrentQuestion) {
-                          _checkAnswer();
-                        }
-                      },
-                      decoration: InputDecoration(
-                        labelText: '請輸入英文單字',
-                        hintText: '例如：apple cider vinegar',
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(16),
-                        ),
-                        filled: true,
-                        fillColor: Colors.white,
+                  ),
+                  SizedBox(height: isMobile ? 18 : 32),
+                  TextField(
+                    controller: _answerController,
+                    focusNode: _answerFocusNode,
+                    enabled: !_hasCheckedCurrentQuestion,
+                    textInputAction: TextInputAction.done,
+                    onSubmitted: (_) {
+                      if (!_hasCheckedCurrentQuestion) {
+                        _checkAnswer();
+                      }
+                    },
+                    decoration: InputDecoration(
+                      labelText: '請輸入英文單字',
+                      hintText: '例如：apple cider vinegar',
+                      isDense: isMobile,
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(16),
                       ),
+                      filled: true,
+                      fillColor: Colors.white,
                     ),
-                    const SizedBox(height: 18),
-                    if (_resultText != null)
-                      Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.all(14),
-                        decoration: BoxDecoration(
+                  ),
+                  SizedBox(height: isMobile ? 12 : 18),
+                  if (_resultText != null)
+                    Container(
+                      width: double.infinity,
+                      padding: EdgeInsets.all(isMobile ? 12 : 14),
+                      decoration: BoxDecoration(
+                        color: _lastAnswerCorrect == true
+                            ? Colors.green.shade50
+                            : _lastAnswerCorrect == false
+                                ? Colors.red.shade50
+                                : Colors.orange.shade50,
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(
                           color: _lastAnswerCorrect == true
-                              ? Colors.green.shade50
+                              ? Colors.green.shade300
                               : _lastAnswerCorrect == false
-                                  ? Colors.red.shade50
-                                  : Colors.orange.shade50,
-                          borderRadius: BorderRadius.circular(14),
-                          border: Border.all(
-                            color: _lastAnswerCorrect == true
-                                ? Colors.green.shade300
-                                : _lastAnswerCorrect == false
-                                    ? Colors.red.shade300
-                                    : Colors.orange.shade300,
-                          ),
-                        ),
-                        child: Text(
-                          _resultText!,
-                          textAlign: TextAlign.center,
-                          style: TextStyle(
-                            fontSize: 16,
-                            fontWeight: FontWeight.w600,
-                            color: _lastAnswerCorrect == true
-                                ? Colors.green.shade800
-                                : _lastAnswerCorrect == false
-                                    ? Colors.red.shade800
-                                    : Colors.orange.shade800,
-                          ),
+                                  ? Colors.red.shade300
+                                  : Colors.orange.shade300,
                         ),
                       ),
-                    const SizedBox(height: 24),
-                    if (!_hasCheckedCurrentQuestion)
-                      SizedBox(
-                        width: double.infinity,
-                        child: FilledButton(
-                          onPressed: _checkAnswer,
-                          child: const Text('確認答案'),
+                      child: Text(
+                        _resultText!,
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          fontSize: isMobile ? 15 : 16,
+                          fontWeight: FontWeight.w600,
+                          color: _lastAnswerCorrect == true
+                              ? Colors.green.shade800
+                              : _lastAnswerCorrect == false
+                                  ? Colors.red.shade800
+                                  : Colors.orange.shade800,
                         ),
                       ),
-                    if (_hasCheckedCurrentQuestion)
-                      SizedBox(
-                        width: double.infinity,
-                        child: FilledButton(
-                          onPressed: _pickRandomQuestion,
-                          child: const Text('下一題'),
-                        ),
+                    ),
+                  SizedBox(height: isMobile ? 16 : 24),
+                  if (!_hasCheckedCurrentQuestion)
+                    SizedBox(
+                      width: double.infinity,
+                      height: isMobile ? 44 : 48,
+                      child: FilledButton(
+                        onPressed: _checkAnswer,
+                        child: const Text('確認答案'),
                       ),
-                  ],
-                ),
+                    ),
+                  if (_hasCheckedCurrentQuestion)
+                    SizedBox(
+                      width: double.infinity,
+                      height: isMobile ? 44 : 48,
+                      child: FilledButton(
+                        onPressed: _pickRandomQuestion,
+                        child: const Text('下一題'),
+                      ),
+                    ),
+                ],
               ),
             ),
           ),
         ),
+        SizedBox(height: isMobile ? 10 : 16),
         Text(
           '目前題庫：${_words.length} 題',
           style: TextStyle(
             color: Colors.grey.shade600,
+            fontSize: isMobile ? 13 : 14,
           ),
         ),
       ],
@@ -416,52 +464,69 @@ class _ScoreCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Card(
-      elevation: 1,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(22),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.all(18),
-        child: Row(
-          children: [
-            Expanded(
-              child: Wrap(
-                spacing: 12,
-                runSpacing: 12,
-                children: [
-                  _ScoreChip(
-                    label: '答對',
-                    value: correctCount.toString(),
-                    color: Colors.green,
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final isMobile = constraints.maxWidth < 600;
+        final isVerySmall = constraints.maxWidth < 380;
+
+        return Card(
+          elevation: 1,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(isMobile ? 18 : 22),
+          ),
+          child: Padding(
+            padding: EdgeInsets.all(isMobile ? 12 : 18),
+            child: Column(
+              children: [
+                GridView.count(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  crossAxisCount: isMobile ? 2 : 4,
+                  mainAxisSpacing: isMobile ? 10 : 12,
+                  crossAxisSpacing: isMobile ? 10 : 12,
+                  childAspectRatio: isVerySmall
+                      ? 1.9
+                      : isMobile
+                          ? 2.15
+                          : 1.75,
+                  children: [
+                    _ScoreChip(
+                      label: '答對',
+                      value: correctCount.toString(),
+                      color: Colors.green,
+                    ),
+                    _ScoreChip(
+                      label: '答錯',
+                      value: wrongCount.toString(),
+                      color: Colors.red,
+                    ),
+                    _ScoreChip(
+                      label: '總答題',
+                      value: total.toString(),
+                      color: Colors.blue,
+                    ),
+                    _ScoreChip(
+                      label: '正確率',
+                      value: '$accuracy%',
+                      color: Colors.purple,
+                    ),
+                  ],
+                ),
+                SizedBox(height: isMobile ? 10 : 14),
+                SizedBox(
+                  width: isMobile ? double.infinity : 180,
+                  height: isMobile ? 40 : 44,
+                  child: OutlinedButton.icon(
+                    onPressed: onClear,
+                    icon: const Icon(Icons.refresh, size: 18),
+                    label: const Text('清空紀錄'),
                   ),
-                  _ScoreChip(
-                    label: '答錯',
-                    value: wrongCount.toString(),
-                    color: Colors.red,
-                  ),
-                  _ScoreChip(
-                    label: '總答題',
-                    value: total.toString(),
-                    color: Colors.blue,
-                  ),
-                  _ScoreChip(
-                    label: '正確率',
-                    value: '$accuracy%',
-                    color: Colors.purple,
-                  ),
-                ],
-              ),
+                ),
+              ],
             ),
-            const SizedBox(width: 12),
-            OutlinedButton.icon(
-              onPressed: onClear,
-              icon: const Icon(Icons.refresh),
-              label: const Text('清空紀錄'),
-            ),
-          ],
-        ),
-      ),
+          ),
+        );
+      },
     );
   }
 }
@@ -479,9 +544,14 @@ class _ScoreChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final width = MediaQuery.of(context).size.width;
+    final isVerySmall = width < 380;
+
     return Container(
-      width: 118,
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      padding: EdgeInsets.symmetric(
+        horizontal: isVerySmall ? 10 : 12,
+        vertical: isVerySmall ? 8 : 10,
+      ),
       decoration: BoxDecoration(
         color: color.withValues(alpha: 0.08),
         borderRadius: BorderRadius.circular(16),
@@ -490,22 +560,27 @@ class _ScoreChip extends StatelessWidget {
         ),
       ),
       child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
             label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
             style: TextStyle(
               color: color,
-              fontSize: 13,
+              fontSize: isVerySmall ? 12 : 13,
               fontWeight: FontWeight.w600,
             ),
           ),
-          const SizedBox(height: 4),
+          const SizedBox(height: 2),
           Text(
             value,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
             style: TextStyle(
               color: color,
-              fontSize: 24,
+              fontSize: isVerySmall ? 21 : 24,
               fontWeight: FontWeight.bold,
             ),
           ),
@@ -526,29 +601,34 @@ class _ErrorView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Center(
-      child: Card(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(
-                Icons.error_outline,
-                size: 48,
-                color: Colors.red,
-              ),
-              const SizedBox(height: 16),
-              Text(
-                message,
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 16),
-              FilledButton(
-                onPressed: onRetry,
-                child: const Text('重新讀取'),
-              ),
-            ],
+    final isMobile = MediaQuery.of(context).size.width < 600;
+
+    return Padding(
+      padding: EdgeInsets.only(top: isMobile ? 80 : 120),
+      child: Center(
+        child: Card(
+          child: Padding(
+            padding: EdgeInsets.all(isMobile ? 20 : 24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(
+                  Icons.error_outline,
+                  size: 48,
+                  color: Colors.red,
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  message,
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 16),
+                FilledButton(
+                  onPressed: onRetry,
+                  child: const Text('重新讀取'),
+                ),
+              ],
+            ),
           ),
         ),
       ),
