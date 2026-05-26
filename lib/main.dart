@@ -1,11 +1,15 @@
+import 'dart:convert';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 const supabaseUrl = 'https://qjimgaeizxbswxgldgcl.supabase.co/';
 const supabaseAnonKey =
     'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFqaW1nYWVpenhic3d4Z2xkZ2NsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk3MTA0NTcsImV4cCI6MjA5NTI4NjQ1N30.FWISDms_YBtRlfzYYHmsIov-7Gwpuv182BUmpeuxYMw';
+
+const String statsStorageKey = 'word_practice_stats_v1';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -59,6 +63,44 @@ class WordItem {
   }
 }
 
+class WordStats {
+  final int correct;
+  final int wrong;
+
+  const WordStats({
+    this.correct = 0,
+    this.wrong = 0,
+  });
+
+  int get total => correct + wrong;
+
+  int get delta => wrong - correct;
+
+  WordStats copyWith({
+    int? correct,
+    int? wrong,
+  }) {
+    return WordStats(
+      correct: correct ?? this.correct,
+      wrong: wrong ?? this.wrong,
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'correct': correct,
+      'wrong': wrong,
+    };
+  }
+
+  factory WordStats.fromJson(Map<String, dynamic> json) {
+    return WordStats(
+      correct: (json['correct'] as num?)?.toInt() ?? 0,
+      wrong: (json['wrong'] as num?)?.toInt() ?? 0,
+    );
+  }
+}
+
 class PracticePage extends StatefulWidget {
   const PracticePage({super.key});
 
@@ -72,17 +114,29 @@ class _PracticePageState extends State<PracticePage> {
   final Random _random = Random();
 
   List<WordItem> _words = [];
+  Map<int, WordStats> _statsByWordId = {};
   WordItem? _currentWord;
 
   bool _loading = true;
   String? _errorMessage;
 
-  int _correctCount = 0;
-  int _wrongCount = 0;
-
   String? _resultText;
   bool? _lastAnswerCorrect;
   bool _hasCheckedCurrentQuestion = false;
+
+  int get _correctCount {
+    return _statsByWordId.values.fold<int>(
+      0,
+      (sum, stats) => sum + stats.correct,
+    );
+  }
+
+  int get _wrongCount {
+    return _statsByWordId.values.fold<int>(
+      0,
+      (sum, stats) => sum + stats.wrong,
+    );
+  }
 
   @override
   void initState() {
@@ -95,6 +149,39 @@ class _PracticePageState extends State<PracticePage> {
     _answerController.dispose();
     _answerFocusNode.dispose();
     super.dispose();
+  }
+
+  Future<Map<int, WordStats>> _loadSavedStats() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(statsStorageKey);
+
+    if (raw == null || raw.trim().isEmpty) {
+      return {};
+    }
+
+    try {
+      final decoded = jsonDecode(raw) as Map<String, dynamic>;
+
+      return decoded.map((key, value) {
+        return MapEntry(
+          int.parse(key),
+          WordStats.fromJson(value as Map<String, dynamic>),
+        );
+      });
+    } catch (_) {
+      await prefs.remove(statsStorageKey);
+      return {};
+    }
+  }
+
+  Future<void> _saveStats() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    final data = _statsByWordId.map((wordId, stats) {
+      return MapEntry(wordId.toString(), stats.toJson());
+    });
+
+    await prefs.setString(statsStorageKey, jsonEncode(data));
   }
 
   Future<void> _loadWords() async {
@@ -124,9 +211,18 @@ class _PracticePageState extends State<PracticePage> {
         return;
       }
 
+      final savedStats = await _loadSavedStats();
+      final firstWord = _pickWeightedWordFrom(
+        words: words,
+        statsByWordId: savedStats,
+        currentWord: null,
+        avoidCurrentWord: false,
+      );
+
       setState(() {
         _words = words;
-        _currentWord = words[_random.nextInt(words.length)];
+        _statsByWordId = savedStats;
+        _currentWord = firstWord;
         _loading = false;
         _resultText = null;
         _lastAnswerCorrect = null;
@@ -142,16 +238,61 @@ class _PracticePageState extends State<PracticePage> {
     }
   }
 
-  void _pickRandomQuestion() {
-    if (_words.isEmpty) return;
+  WordItem _pickWeightedWordFrom({
+    required List<WordItem> words,
+    required Map<int, WordStats> statsByWordId,
+    required WordItem? currentWord,
+    required bool avoidCurrentWord,
+  }) {
+    List<WordItem> candidates = words;
 
-    WordItem nextWord = _words[_random.nextInt(_words.length)];
+    if (avoidCurrentWord && currentWord != null && words.length > 1) {
+      candidates = words.where((word) => word.id != currentWord.id).toList();
+    }
 
-    if (_words.length > 1 && _currentWord != null) {
-      while (nextWord.id == _currentWord!.id) {
-        nextWord = _words[_random.nextInt(_words.length)];
+    // 每個單字原始權重：e^(答錯次數 - 答對次數)
+    // 這裡使用 softmax 等比例算法：e^(delta - maxDelta)
+    // 抽選機率完全等價，但可以避免數字太大造成 overflow。
+    final maxDelta = candidates
+        .map((word) => (statsByWordId[word.id]?.delta ?? 0).toDouble())
+        .reduce(max);
+
+    final weightedItems = candidates.map((word) {
+      final delta = (statsByWordId[word.id]?.delta ?? 0).toDouble();
+      final weight = exp(delta - maxDelta);
+      return MapEntry(word, weight);
+    }).toList();
+
+    final totalWeight = weightedItems.fold<double>(
+      0,
+      (sum, item) => sum + item.value,
+    );
+
+    if (totalWeight <= 0 || totalWeight.isNaN || totalWeight.isInfinite) {
+      return candidates[_random.nextInt(candidates.length)];
+    }
+
+    double roll = _random.nextDouble() * totalWeight;
+
+    for (final item in weightedItems) {
+      roll -= item.value;
+      if (roll <= 0) {
+        return item.key;
       }
     }
+
+    return weightedItems.last.key;
+  }
+
+  void _pickNextQuestion() {
+    if (_words.isEmpty) return;
+
+    final nextWord = _pickWeightedWordFrom(
+      words: _words,
+      statsByWordId: _statsByWordId,
+      currentWord: _currentWord,
+      avoidCurrentWord: true,
+    );
 
     setState(() {
       _currentWord = nextWord;
@@ -164,9 +305,9 @@ class _PracticePageState extends State<PracticePage> {
     _focusAnswerInputIfDesktop();
   }
 
-  void _checkAnswer() {
+  Future<void> _checkAnswer() async {
     final word = _currentWord;
-    if (word == null) return;
+    if (word == null || _hasCheckedCurrentQuestion) return;
 
     final userAnswer = _answerController.text;
 
@@ -183,37 +324,56 @@ class _PracticePageState extends State<PracticePage> {
     final isCorrect =
         _normalizeAnswer(userAnswer) == _normalizeAnswer(word.english);
 
+    final currentStats = _statsByWordId[word.id] ?? const WordStats();
+
     setState(() {
       _lastAnswerCorrect = isCorrect;
       _hasCheckedCurrentQuestion = true;
 
       if (isCorrect) {
-        _correctCount++;
+        _statsByWordId[word.id] = currentStats.copyWith(
+          correct: currentStats.correct + 1,
+        );
         _resultText = '答對了！';
       } else {
-        _wrongCount++;
+        _statsByWordId[word.id] = currentStats.copyWith(
+          wrong: currentStats.wrong + 1,
+        );
         _resultText = '答錯了，正確答案是：${word.english}';
       }
     });
+
+    await _saveStats();
   }
 
-  void _clearRecord() {
-    final shouldGoNext = _hasCheckedCurrentQuestion;
+  Future<void> _clearAllRecords() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(statsStorageKey);
 
     setState(() {
-      _correctCount = 0;
-      _wrongCount = 0;
+      _statsByWordId = {};
       _resultText = null;
       _lastAnswerCorrect = null;
       _hasCheckedCurrentQuestion = false;
       _answerController.clear();
     });
 
-    if (shouldGoNext) {
-      _pickRandomQuestion();
-    } else {
-      _focusAnswerInputIfDesktop();
-    }
+    _focusAnswerInputIfDesktop();
+  }
+
+  Future<void> _openRecordPage() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => WordsRecordPage(
+          words: _words,
+          statsByWordId: _statsByWordId,
+          onClearRecords: _clearAllRecords,
+        ),
+      ),
+    );
+
+    if (!mounted) return;
+    setState(() {});
   }
 
   void _focusAnswerInputIfDesktop() {
@@ -251,6 +411,13 @@ class _PracticePageState extends State<PracticePage> {
           overflow: TextOverflow.ellipsis,
         ),
         centerTitle: true,
+        actions: [
+          IconButton(
+            tooltip: '單字紀錄',
+            onPressed: _words.isEmpty ? null : _openRecordPage,
+            icon: const Icon(Icons.format_list_numbered_rounded),
+          ),
+        ],
       ),
       body: SafeArea(
         child: LayoutBuilder(
@@ -309,6 +476,7 @@ class _PracticePageState extends State<PracticePage> {
     final screenWidth = MediaQuery.of(context).size.width;
     final isMobile = screenWidth < 600;
     final isVerySmall = screenWidth < 380;
+    final currentStats = _statsByWordId[word.id] ?? const WordStats();
 
     return Column(
       mainAxisSize: MainAxisSize.min,
@@ -318,7 +486,8 @@ class _PracticePageState extends State<PracticePage> {
           wrongCount: _wrongCount,
           total: total,
           accuracy: accuracy,
-          onClear: _clearRecord,
+          onClear: _clearAllRecords,
+          onOpenRecords: _openRecordPage,
         ),
         SizedBox(height: isMobile ? 12 : 24),
         SizedBox(
@@ -353,6 +522,29 @@ class _PracticePageState extends State<PracticePage> {
                       fontWeight: FontWeight.bold,
                       height: 1.15,
                     ),
+                  ),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    alignment: WrapAlignment.center,
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      _MiniStatPill(
+                        label: '這題答對',
+                        value: currentStats.correct.toString(),
+                        color: Colors.green,
+                      ),
+                      _MiniStatPill(
+                        label: '這題答錯',
+                        value: currentStats.wrong.toString(),
+                        color: Colors.red,
+                      ),
+                      _MiniStatPill(
+                        label: '權重指數',
+                        value: '錯-對=${currentStats.delta}',
+                        color: Colors.blueGrey,
+                      ),
+                    ],
                   ),
                   SizedBox(height: isMobile ? 18 : 32),
                   TextField(
@@ -425,7 +617,7 @@ class _PracticePageState extends State<PracticePage> {
                       width: double.infinity,
                       height: isMobile ? 44 : 48,
                       child: FilledButton(
-                        onPressed: _pickRandomQuestion,
+                        onPressed: _pickNextQuestion,
                         child: const Text('下一題'),
                       ),
                     ),
@@ -453,6 +645,7 @@ class _ScoreCard extends StatelessWidget {
   final int total;
   final int accuracy;
   final VoidCallback onClear;
+  final VoidCallback onOpenRecords;
 
   const _ScoreCard({
     required this.correctCount,
@@ -460,6 +653,7 @@ class _ScoreCard extends StatelessWidget {
     required this.total,
     required this.accuracy,
     required this.onClear,
+    required this.onOpenRecords,
   });
 
   @override
@@ -513,15 +707,55 @@ class _ScoreCard extends StatelessWidget {
                   ],
                 ),
                 SizedBox(height: isMobile ? 10 : 14),
-                SizedBox(
-                  width: isMobile ? double.infinity : 180,
-                  height: isMobile ? 40 : 44,
-                  child: OutlinedButton.icon(
-                    onPressed: onClear,
-                    icon: const Icon(Icons.refresh, size: 18),
-                    label: const Text('清空紀錄'),
+                if (isMobile)
+                  Column(
+                    children: [
+                      SizedBox(
+                        width: double.infinity,
+                        height: 42,
+                        child: FilledButton.icon(
+                          onPressed: onOpenRecords,
+                          icon: const Icon(Icons.list_alt_rounded, size: 18),
+                          label: const Text('查看單字紀錄'),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      SizedBox(
+                        width: double.infinity,
+                        height: 42,
+                        child: OutlinedButton.icon(
+                          onPressed: onClear,
+                          icon: const Icon(Icons.refresh, size: 18),
+                          label: const Text('清空紀錄'),
+                        ),
+                      ),
+                    ],
+                  )
+                else
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      SizedBox(
+                        width: 180,
+                        height: 44,
+                        child: FilledButton.icon(
+                          onPressed: onOpenRecords,
+                          icon: const Icon(Icons.list_alt_rounded, size: 18),
+                          label: const Text('查看紀錄'),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      SizedBox(
+                        width: 180,
+                        height: 44,
+                        child: OutlinedButton.icon(
+                          onPressed: onClear,
+                          icon: const Icon(Icons.refresh, size: 18),
+                          label: const Text('清空紀錄'),
+                        ),
+                      ),
+                    ],
                   ),
-                ),
               ],
             ),
           ),
@@ -585,6 +819,356 @@ class _ScoreChip extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _MiniStatPill extends StatelessWidget {
+  final String label;
+  final String value;
+  final Color color;
+
+  const _MiniStatPill({
+    required this.label,
+    required this.value,
+    required this.color,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final isSmall = MediaQuery.of(context).size.width < 380;
+
+    return Container(
+      padding: EdgeInsets.symmetric(
+        horizontal: isSmall ? 9 : 10,
+        vertical: isSmall ? 5 : 6,
+      ),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(
+          color: color.withValues(alpha: 0.22),
+        ),
+      ),
+      child: Text(
+        '$label：$value',
+        style: TextStyle(
+          color: color,
+          fontSize: isSmall ? 12 : 13,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+    );
+  }
+}
+
+class WordsRecordPage extends StatefulWidget {
+  final List<WordItem> words;
+  final Map<int, WordStats> statsByWordId;
+  final Future<void> Function() onClearRecords;
+
+  const WordsRecordPage({
+    super.key,
+    required this.words,
+    required this.statsByWordId,
+    required this.onClearRecords,
+  });
+
+  @override
+  State<WordsRecordPage> createState() => _WordsRecordPageState();
+}
+class _WordsRecordPageState extends State<WordsRecordPage> {
+  late Map<int, WordStats> _statsByWordId;
+
+  @override
+  void initState() {
+    super.initState();
+    _statsByWordId = Map<int, WordStats>.from(widget.statsByWordId);
+  }
+
+  Future<void> _clearRecords() async {
+    await widget.onClearRecords();
+
+    if (!mounted) return;
+
+    setState(() {
+      _statsByWordId = {};
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('所有單字紀錄已清空。'),
+      ),
+    );
+  }
+
+  Color _statusColor(WordStats stats) {
+    if (stats.correct == 0 && stats.wrong == 0) {
+      return Colors.grey;
+    }
+
+    if (stats.wrong > stats.correct) {
+      return Colors.red;
+    }
+
+    if (stats.correct == stats.wrong) {
+      return Colors.amber;
+    }
+
+    return Colors.green;
+  }
+
+  int _statusSortRank(WordStats stats) {
+    if (stats.wrong > stats.correct) {
+      return 0; // 紅色：答錯較多，最上面
+    }
+
+    if (stats.correct == stats.wrong && stats.total > 0) {
+      return 1; // 黃色：答對答錯一樣多
+    }
+
+    if (stats.total == 0) {
+      return 2; // 灰色：完全沒有紀錄
+    }
+
+    return 3; // 綠色：答對較多，最下面
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final words = [...widget.words]..sort((a, b) {
+        final statsA = _statsByWordId[a.id] ?? const WordStats();
+        final statsB = _statsByWordId[b.id] ?? const WordStats();
+
+        final rankA = _statusSortRank(statsA);
+        final rankB = _statusSortRank(statsB);
+
+        if (rankA != rankB) {
+          return rankA.compareTo(rankB);
+        }
+
+        return a.id.compareTo(b.id);
+      });
+
+    final isMobile = MediaQuery.of(context).size.width < 600;
+
+    return Scaffold(
+      backgroundColor: const Color(0xFFF4F7FB),
+      appBar: AppBar(
+        title: const Text('單字紀錄'),
+        centerTitle: true,
+      ),
+      body: SafeArea(
+        child: ListView(
+          padding: EdgeInsets.fromLTRB(
+            isMobile ? 12 : 20,
+            12,
+            isMobile ? 12 : 20,
+            24,
+          ),
+          children: [
+            Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 820),
+                child: Column(
+                  children: [
+                    Card(
+                      elevation: 1,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(isMobile ? 18 : 22),
+                      ),
+                      child: Padding(
+                        padding: EdgeInsets.all(isMobile ? 14 : 18),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              '單字紀錄總覽',
+                              style: TextStyle(
+                                fontSize: isMobile ? 18 : 20,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            Text(
+                              '排序：答錯較多在最上面，接著是一樣多、尚未作答，答對較多放最下面。',
+                              style: TextStyle(
+                                color: Colors.grey.shade700,
+                                fontSize: isMobile ? 13 : 14,
+                                height: 1.4,
+                              ),
+                            ),
+                            const SizedBox(height: 14),
+                            SizedBox(
+                              width: double.infinity,
+                              height: 44,
+                              child: OutlinedButton.icon(
+                                onPressed: _clearRecords,
+                                icon: const Icon(Icons.delete_outline_rounded),
+                                label: const Text('清空所有紀錄'),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    SizedBox(height: isMobile ? 8 : 12),
+                    ...words.map((word) {
+                      final stats = _statsByWordId[word.id] ?? const WordStats();
+                      final color = _statusColor(stats);
+
+                      return Padding(
+                        padding: EdgeInsets.only(bottom: isMobile ? 8 : 10),
+                        child: _WordRecordCard(
+                          word: word,
+                          stats: stats,
+                          color: color,
+                        ),
+                      );
+                    }),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _WordRecordCard extends StatelessWidget {
+  final WordItem word;
+  final WordStats stats;
+  final Color color;
+
+  const _WordRecordCard({
+    required this.word,
+    required this.stats,
+    required this.color,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final isVerySmall = MediaQuery.of(context).size.width < 380;
+
+    return Container(
+      width: double.infinity,
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: color.withValues(alpha: 0.28),
+        ),
+      ),
+      child: Padding(
+        padding: EdgeInsets.symmetric(
+          horizontal: isVerySmall ? 10 : 12,
+          vertical: isVerySmall ? 8 : 10,
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            Container(
+              width: 8,
+              height: 42,
+              decoration: BoxDecoration(
+                color: color.withValues(alpha: 0.75),
+                borderRadius: BorderRadius.circular(999),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    word.chinese,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: isVerySmall ? 16 : 17,
+                      fontWeight: FontWeight.bold,
+                      height: 1.15,
+                    ),
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    word.english,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: Colors.grey.shade800,
+                      fontSize: isVerySmall ? 13 : 14,
+                      height: 1.15,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 8),
+            Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                _RecordPill(
+                  label: '對',
+                  value: stats.correct.toString(),
+                  color: Colors.green,
+                ),
+                const SizedBox(height: 4),
+                _RecordPill(
+                  label: '錯',
+                  value: stats.wrong.toString(),
+                  color: Colors.red,
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _RecordPill extends StatelessWidget {
+  final String label;
+  final String value;
+  final Color color;
+
+  const _RecordPill({
+    required this.label,
+    required this.value,
+    required this.color,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final isVerySmall = MediaQuery.of(context).size.width < 380;
+
+    return Container(
+      constraints: const BoxConstraints(minWidth: 48),
+      padding: EdgeInsets.symmetric(
+        horizontal: isVerySmall ? 7 : 8,
+        vertical: isVerySmall ? 3 : 4,
+      ),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.9),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(
+          color: color.withValues(alpha: 0.25),
+        ),
+      ),
+      child: Text(
+        '$label $value',
+        textAlign: TextAlign.center,
+        style: TextStyle(
+          color: color,
+          fontSize: isVerySmall ? 11 : 12,
+          fontWeight: FontWeight.w700,
+        ),
       ),
     );
   }
